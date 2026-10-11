@@ -146,7 +146,15 @@ def single_party(text: str) -> str | None:
 _NOT_WINNER = re.compile(
     r"\bprimar(y|ies)\b|\bnomin(ee|ation|ated)\b|\brunoff\b|\bmargin\b|\bby (more|less) than\b"
     r"|\bvote share\b|\bpopular vote\b|\bturnout\b|\bdebate\b|\bendorse|\bdrop(s)? out\b|\brecount\b"
-    r"|\bconcede\b|\bpoll(s|ing)?\b|\bwin by\b|\bpercent(age)? of\b|\braise\b|\bfundrais", re.I)
+    r"|\bconcede\b|\bpoll(s|ing)?\b|\bwin by\b|\bpercent(age)? of\b|\braise\b|\bfundrais"
+    r"|\bcombo\b|\bparlay\b|\bsweep\b|\bboth\b|\ball (of|three|four|five)\b|\bany of\b", re.I)
+
+
+def count_states(text: str) -> int:
+    """How many different states a title names (combos/parlays name several)."""
+    found = {m.lower() for m in _STATE_RE.findall(text or "")}
+    found |= {c for c, _ in _DISTRICT_CODE_RE.findall(text or "")}
+    return len(found)
 
 
 def is_winner_question(text: str) -> bool:
@@ -284,6 +292,7 @@ def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) 
     m["office"] = m["text"].map(detect_office)
     m = m[m["office"].notna()]
     m = m[m["text"].map(is_winner_question)]
+    m = m[m["text"].map(count_states) <= 1]   # drop multi-state combos/parlays
     st = m["text"].map(detect_state)
     m["state"] = [s[0] for s in st]
     m["code"] = [s[1] for s in st]
@@ -332,7 +341,24 @@ def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) 
             "dem_market": dem_mkt.iloc[0] if len(dem_mkt) else None,
         })
     df = pd.DataFrame(races)
+    if df.empty:
+        df = pd.DataFrame(columns=RACE_COLS)
     return df
+
+
+def filter_report(markets: pd.DataFrame) -> dict:
+    """How many markets survive each filtering step (for the in-app data check)."""
+    if markets is None or markets.empty:
+        return {"fetched": 0}
+    t = markets["event_title"].fillna("") + " | " + markets["title"].fillna("")
+    out = {"fetched": len(t)}
+    t = t[t.map(detect_cycle)]; out["2026 cycle"] = len(t)
+    t = t[t.map(detect_office).notna()]; out["Senate/Gov/House"] = len(t)
+    t = t[t.map(is_winner_question)]; out["winner questions"] = len(t)
+    t = t[t.map(count_states) <= 1]; out["single state"] = len(t)
+    t = t[t.map(lambda x: detect_state(x)[0] is not None or bool(re.search(r"control|majority", x, re.I)))]
+    out["state found"] = len(t)
+    return out
 
 
 def pick_best(races: pd.DataFrame) -> pd.DataFrame:
