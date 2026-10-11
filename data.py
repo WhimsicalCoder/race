@@ -97,6 +97,52 @@ def detect_party(text: str) -> str | None:
     return None
 
 
+def _name_tokens(name: str) -> list[str]:
+    """Surname-ish tokens of a candidate name, for matching inside longer text."""
+    toks = [t for t in re.split(r"[\s,]+", name or "") if len(t) > 2 and t[0].isupper()]
+    return toks[-1:] or toks
+
+
+def party_near_name(name: str | None, text: str | None) -> str | None:
+    """Party written right next to the candidate's name, e.g. "El-Sayed (D)" or
+    "Democrat Abdul El-Sayed". Whole-race text often names both parties, so only
+    party words touching the name count."""
+    if not name or not text:
+        return None
+    for tok in _name_tokens(name):
+        n = re.escape(tok)
+        pats = [
+            (rf"{n}\s*\((D|Dem|Democrat|Democratic)\b", "D"), (rf"{n}\s*\((R|Rep|Republican|GOP)\b", "R"),
+            (rf"{n}\s*\((I|Ind|Independent)\b", "I"),
+            (rf"\bDemocrat(?:ic)?(?:\s+(?:candidate|nominee|challenger|incumbent|Senator|Sen\.|Rep\.|Gov\.))?\s+(?:[A-Z][\w.'-]+\s+){{0,2}}{n}\b", "D"),
+            (rf"\bRepublican(?:\s+(?:candidate|nominee|challenger|incumbent|Senator|Sen\.|Rep\.|Gov\.))?\s+(?:[A-Z][\w.'-]+\s+){{0,2}}{n}\b", "R"),
+            (rf"\b{n}\b[^.;\n]{{0,40}}\b(?:the\s+)?Democratic\s+(?:nominee|candidate|party)", "D"),
+            (rf"\b{n}\b[^.;\n]{{0,40}}\b(?:the\s+)?Republican\s+(?:nominee|candidate|party)", "R"),
+        ]
+        for pat, party in pats:
+            if re.search(pat, text):
+                return party
+    return None
+
+
+def load_overrides(path: str = "parties.csv") -> dict[str, str]:
+    """Optional name,party CSV for candidates the venues don't label."""
+    try:
+        df = pd.read_csv(path, comment="#")
+        return {str(n).strip().lower(): str(p).strip().upper()[:1]
+                for n, p in zip(df["name"], df["party"]) if str(n).strip()}
+    except Exception:
+        return {}
+
+
+def single_party(text: str) -> str | None:
+    """A party only when the text names exactly one (so "Dem vs GOP" titles don't count)."""
+    t = text or ""
+    found = {p for p, pat in (("D", r"\bdemocrat(ic|s)?\b|\bdems?\b|\(D\)"),
+                              ("R", r"\brepublican(s)?\b|\bGOP\b|\(R\)")) if re.search(pat, t, re.I)}
+    return found.pop() if len(found) == 1 else None
+
+
 def detect_cycle(text: str) -> bool:
     """True unless the title clearly names a different cycle than 2026."""
     years = re.findall(r"\b(20\d\d)\b", text or "")
@@ -138,21 +184,28 @@ def _row(m, event_title: str | None) -> dict:
         "vol_24h": m.stats.volume_24h, "volume": m.stats.volume_total,
         "close": pd.to_datetime(m.close_timestamp, unit="ms", utc=True) if m.close_timestamp else pd.NaT,
         "url": m.url,
+        "desc": " ".join(str(x) for x in (m.description, (m.info or {}).get("subtitle"),
+                                           (m.info or {}).get("yes_sub_title")) if x)[:3000],
     }
 
 
 def fetch_markets(venue: str, pages: int = 3) -> pd.DataFrame:
     """Every election-looking market on one venue, deduplicated."""
     ex, rows, seen = _venue(venue), [], set()
+    by_event = hasattr(ex, "search_events")
     for q in SEARCHES:
         cursor = None
         for _ in range(pages):
-            page = ex.search_events(q, limit=100, cursor=cursor)
-            for e in page:
-                for m in e.markets:
-                    if m.id not in seen:
-                        seen.add(m.id)
-                        rows.append(_row(m, e.title))
+            if by_event:
+                page = ex.search_events(q, limit=100, cursor=cursor)
+                pairs = [(m, e.title) for e in page for m in e.markets]
+            else:
+                page = ex.search_markets(q, limit=100, cursor=cursor)
+                pairs = [(m, None) for m in page]
+            for m, etitle in pairs:
+                if m.id not in seen:
+                    seen.add(m.id)
+                    rows.append(_row(m, etitle))
             cursor = page.next_cursor
             if not cursor:
                 break
@@ -170,7 +223,47 @@ def fetch_history(market_id: str, days: int = 60) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Markets -> races
 # ----------------------------------------------------------------------------
-def build_races(markets: pd.DataFrame) -> pd.DataFrame:
+def assign_parties(m: pd.DataFrame, overrides: dict[str, str] | None = None) -> pd.DataFrame:
+    """Work out each outcome's party, most reliable source first.
+
+    1. Your parties.csv override  2. the outcome label  3. the market title
+    4. party written beside the candidate's name in the rules/description
+    5. inference: in a race where only one major party was found, the leading
+       unlabeled candidate is taken to be the other major party.
+    """
+    overrides = overrides if overrides is not None else load_overrides()
+    m = m.copy()
+    if "desc" not in m:
+        m["desc"] = ""
+    parties, sources = [], []
+    for lab, title, desc in zip(m["label"].fillna(""), m["title"].fillna(""), m["desc"].fillna("")):
+        lab, title = lab.strip(), title.strip()
+        checks = [
+            ("override", overrides.get(lab.lower()) if lab else None),
+            ("override", overrides.get(title.lower()) if not lab else None),
+            ("label", detect_party(lab)),
+            ("title", party_near_name(lab, title) if lab else None),
+            ("title", single_party(title)),
+            ("rules", party_near_name(lab, desc) if lab else None),
+        ]
+        hit = next(((src, val) for src, val in checks if val), (None, None))
+        sources.append(hit[0]), parties.append(hit[1])
+    m["party"], m["party_src"] = parties, sources
+
+    for _, idx in m.groupby(["venue", "event_id"], sort=False).groups.items():
+        g = m.loc[idx]
+        if len(g) < 2:
+            continue
+        known = set(g["party"].dropna()) & {"D", "R"}
+        unknown = g[g["party"].isna()].sort_values("prob", ascending=False)
+        if len(known) == 1 and len(unknown):
+            other = "R" if "D" in known else "D"
+            top = unknown.index[0]
+            m.loc[top, "party"], m.loc[top, "party_src"] = other, "inferred"
+    return m
+
+
+def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) -> pd.DataFrame:
     """Group markets into races and compute Democratic / Republican odds."""
     if markets is None or markets.empty:
         return pd.DataFrame(columns=RACE_COLS)
@@ -188,8 +281,7 @@ def build_races(markets: pd.DataFrame) -> pd.DataFrame:
     no_state = m["state"].isna() & m["office"].isin(["Senate", "House"])
     m.loc[no_state, "office"] = m.loc[no_state, "office"] + " control"
     m = m[(m["state"].notna()) | m["office"].str.endswith("control")]
-    # Party of each outcome: the label if it has one, else the market title.
-    m["party"] = [detect_party(l) or detect_party(t) for l, t in zip(m["label"].fillna(""), m["title"])]
+    m = assign_parties(m, overrides)
 
     races = []
     for (venue, eid), g in m.groupby(["venue", "event_id"], sort=False):
@@ -222,7 +314,8 @@ def build_races(markets: pd.DataFrame) -> pd.DataFrame:
                         -g.loc[g.party == "R", "chg_24h"].dropna().mean() if (g.party == "R").any() else None),
             "volume": g["volume"].sum(min_count=1), "vol_24h": g["vol_24h"].sum(min_count=1),
             "spread": g["spread"].mean(), "close": g["close"].max(), "url": first["url"],
-            "markets": g[["market_id", "label", "title", "party", "prob", "chg_24h", "vol_24h"]].to_dict("records"),
+            "markets": g[["market_id", "label", "title", "party", "party_src", "prob", "chg_24h", "vol_24h"]].to_dict("records"),
+            "party_inferred": bool((g["party_src"] == "inferred").any()),
             "dem_market": dem_mkt.iloc[0] if len(dem_mkt) else None,
         })
     df = pd.DataFrame(races)
