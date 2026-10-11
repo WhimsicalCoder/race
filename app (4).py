@@ -145,8 +145,19 @@ with tab_map:
         c[1].metric("Republican", pct(r["rep_p"]))
         c[2].metric("24h move (Dem)", pct(r["chg_24h"], True, 1))
         c[3].metric("Total volume", num(r["volume"]))
-        if pd.notna(r.get("venue_gap")) and r["venue_gap"] > 0.03:
-            st.caption(f"⚠️ Venues disagree by {pct(r['venue_gap'])} on this race — a sign of genuine uncertainty or thin trading.")
+        gap = r.get("venue_gap")
+        if pd.notna(gap) and gap > 0.03:
+            versions = r.get("versions") or []
+            lines = "\n".join(f"- **{D.VENUES.get(v['venue'], v['venue'])}**: Dem {pct(v['dem_p'])} · "
+                              f"volume {num(v['volume'])} · _{v['title']}_" for v in versions)
+            if gap > 0.20:
+                st.warning(f"Venues differ by {pct(gap)} on this race. A gap this big usually means they aren't "
+                           f"the same question (or a party label is off), not real disagreement — compare the titles:\n{lines}\n\n"
+                           "If a candidate's party is wrong, fix it in **parties.csv**. The map uses the venue with the most volume.")
+            else:
+                st.caption(f"Venues disagree by {pct(gap)} on this race — usually thin trading or fast-moving news.")
+                with st.expander("Compare venues"):
+                    st.markdown(lines)
         mk = pd.DataFrame(r["markets"]).sort_values("prob", ascending=False)
         mk["label"] = mk["label"].fillna(mk["title"])
         party_name = {"D": "Democrat", "R": "Republican", "I": "Independent"}
@@ -258,7 +269,8 @@ with tab_ads:
     k[0].metric("Toss-up races", int((plan["tier"] == "Toss-up").sum()))
     k[1].metric("Lean races", int((plan["tier"] == "Lean").sum()))
     k[2].metric("Moved ≥3pt in 24h", int((plan["momentum"] >= 0.03).sum()))
-    k[3].metric("Venues disagree ≥5pt", int((plan.get("venue_gap", pd.Series(dtype=float)) >= 0.05).sum()))
+    k[3].metric("Venues disagree 5–20pt", int(plan.get("venue_gap", pd.Series(dtype=float)).between(0.05, 0.20).sum()),
+                help="Bigger gaps are usually mismatched questions, so they're left out of this count.")
 
     # State roll-up: a state with a close Senate AND a close Governor race is a bigger media market story.
     by_state = (plan.groupby(["state", "code"])
