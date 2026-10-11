@@ -143,6 +143,17 @@ def single_party(text: str) -> str | None:
     return found.pop() if len(found) == 1 else None
 
 
+_NOT_WINNER = re.compile(
+    r"\bprimar(y|ies)\b|\bnomin(ee|ation|ated)\b|\brunoff\b|\bmargin\b|\bby (more|less) than\b"
+    r"|\bvote share\b|\bpopular vote\b|\bturnout\b|\bdebate\b|\bendorse|\bdrop(s)? out\b|\brecount\b"
+    r"|\bconcede\b|\bpoll(s|ing)?\b|\bwin by\b|\bpercent(age)? of\b|\braise\b|\bfundrais", re.I)
+
+
+def is_winner_question(text: str) -> bool:
+    """General-election 'who wins' markets only; drops primaries, margins, turnout, debates, etc."""
+    return not _NOT_WINNER.search(text or "")
+
+
 def detect_cycle(text: str) -> bool:
     """True unless the title clearly names a different cycle than 2026."""
     years = re.findall(r"\b(20\d\d)\b", text or "")
@@ -272,6 +283,7 @@ def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) 
     m = m[m["text"].map(detect_cycle)]
     m["office"] = m["text"].map(detect_office)
     m = m[m["office"].notna()]
+    m = m[m["text"].map(is_winner_question)]
     st = m["text"].map(detect_state)
     m["state"] = [s[0] for s in st]
     m["code"] = [s[1] for s in st]
@@ -316,6 +328,7 @@ def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) 
             "spread": g["spread"].mean(), "close": g["close"].max(), "url": first["url"],
             "markets": g[["market_id", "label", "title", "party", "party_src", "prob", "chg_24h", "vol_24h"]].to_dict("records"),
             "party_inferred": bool((g["party_src"] == "inferred").any()),
+            "two_party": bool(len(dem) and len(rep)),
             "dem_market": dem_mkt.iloc[0] if len(dem_mkt) else None,
         })
     df = pd.DataFrame(races)
@@ -323,16 +336,32 @@ def build_races(markets: pd.DataFrame, overrides: dict[str, str] | None = None) 
 
 
 def pick_best(races: pd.DataFrame) -> pd.DataFrame:
-    """One row per race across venues: the venue with the most volume."""
+    """One row per race: the venue with the most volume.
+
+    Within a venue, a race listed twice keeps the market that has both major
+    parties and the most volume. The venue gap compares only *different*
+    venues, and the other venues' versions are kept so they can be checked.
+    """
     if races.empty:
         return races
     r = races.copy()
     r["key"] = r["office"] + "|" + r["code"].fillna("US") + "|" + r["district"].fillna("")
-    r = r.sort_values("volume", ascending=False, na_position="last")
-    best = r.drop_duplicates("key").copy()
-    # Cross-venue disagreement on the Dem odds, where both venues list the race.
-    spread = r.groupby("key")["dem_p"].agg(lambda s: s.max() - s.min() if s.notna().sum() > 1 else np.nan)
-    best["venue_gap"] = best["key"].map(spread)
+    if "two_party" not in r:
+        r["two_party"] = r["dem_p"].notna() & r["rep_p"].notna()
+    r = r.sort_values(["two_party", "volume"], ascending=[False, False], na_position="last")
+    per_venue = r.drop_duplicates(["key", "venue"])          # best market on each venue
+    best = per_venue.drop_duplicates("key").copy()          # best venue overall
+
+    def gap(g):
+        d = g["dem_p"].dropna()
+        return d.max() - d.min() if g["venue"].nunique() > 1 and len(d) > 1 else np.nan
+
+    def others(g):
+        return [{"venue": v, "title": t, "dem_p": d, "volume": vol}
+                for v, t, d, vol in zip(g["venue"], g["title"], g["dem_p"], g["volume"])]
+
+    best["venue_gap"] = best["key"].map(per_venue.groupby("key").apply(gap, include_groups=False))
+    best["versions"] = best["key"].map(per_venue.groupby("key").apply(others, include_groups=False))
     return best
 
 
