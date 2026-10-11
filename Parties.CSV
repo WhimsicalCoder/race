@@ -1,0 +1,6 @@
+# Candidate party overrides. Add a row for any candidate the app labels wrongly
+# or leaves blank. Name must match the outcome name shown in the app.
+# party: D, R or I
+name,party
+Abdul El-Sayed,D
+Mike Rogers,R
