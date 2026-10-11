@@ -23,6 +23,17 @@ Turn on **Demo data** in the sidebar to try it offline. Demo mode uses made-up o
 
 The app searches each venue for election markets and reads each title to work out the state, office (Senate, Governor or House) and district. It then groups the markets into races and computes two-party odds. When a race is listed on more than one venue, it keeps the venue with the most volume and records how far the venues disagree.
 
+## Candidate parties
+
+Some venues give only a candidate's name, with no party. The app works out party in this order:
+
+1. your `parties.csv` override
+2. the outcome name or market title
+3. a party written beside the name in the market's rules, such as "El-Sayed (D)"
+4. inference: in a two-way race where one candidate's party is known, the other leading candidate is assumed to be from the other major party (shown as *inferred*)
+
+If a race shows **No data** or a party looks wrong, add the candidate to `parties.csv` (`name,party`, with party D, R or I) and click Refresh.
+
 ## Caveats
 
 - Odds reflect what traders are betting. They are not a forecast, and thin markets can be badly wrong. Use the sidebar's volume filter.
