@@ -148,10 +148,20 @@ with tab_map:
         if pd.notna(r.get("venue_gap")) and r["venue_gap"] > 0.03:
             st.caption(f"⚠️ Venues disagree by {pct(r['venue_gap'])} on this race — a sign of genuine uncertainty or thin trading.")
         mk = pd.DataFrame(r["markets"]).sort_values("prob", ascending=False)
-        st.dataframe(mk[["label", "party", "prob", "chg_24h", "vol_24h"]], hide_index=True, width="stretch",
-                     column_config={"label": "Outcome",
+        mk["label"] = mk["label"].fillna(mk["title"])
+        party_name = {"D": "Democrat", "R": "Republican", "I": "Independent"}
+        src_note = {"inferred": " (inferred)", "override": " (your list)"}
+        mk["Party"] = [(party_name.get(p, "Unknown") + src_note.get(s, "")) if p else "Unknown"
+                       for p, s in zip(mk["party"], mk.get("party_src", [None] * len(mk)))]
+        st.dataframe(mk[["label", "Party", "prob", "chg_24h", "vol_24h"]], hide_index=True, width="stretch",
+                     column_config={"label": "Candidate",
                                     "prob": st.column_config.ProgressColumn("Odds", min_value=0, max_value=1, format="%.2f"),
-                                    "chg_24h": st.column_config.NumberColumn("24h Δ", format="%+.3f")})
+                                    "chg_24h": st.column_config.NumberColumn("24h Δ", format="%+.3f"),
+                                    "vol_24h": st.column_config.NumberColumn("24h volume", format="%.0f")})
+        if (mk["Party"] == "Unknown").any() or r.get("party_inferred"):
+            st.caption("Party is read from the market's title and rules. **(inferred)** means the venue didn't label "
+                       "it, so the app assumed the leading unlabeled candidate is the other major party. "
+                       "To pin or correct a party, add the name to **parties.csv**.")
         if r.get("dem_market"):
             try:
                 h = history(demo, r["dem_market"])
@@ -303,6 +313,11 @@ with tab_ads:
 # ----------------------------------------------------------------------------
 with tab_all:
     st.subheader("Every race with a market")
+    unlabeled = races[races["dem_p"].isna() & ~races["office"].str.endswith("control")]
+    if len(unlabeled):
+        st.warning(f"{len(unlabeled)} race(s) show **No data** because no candidate's party could be found: "
+                   + ", ".join(unlabeled["race"].head(10))
+                   + ". Add those candidates to **parties.csv** (name,party) and refresh.")
     show = races.sort_values(["office", "state"])
     st.dataframe(show[["office", "race", "rating", "dem_p", "rep_p", "leader", "chg_24h", "volume", "spread",
                        "venue", "venue_gap", "title"]], hide_index=True, width="stretch", height=520,
